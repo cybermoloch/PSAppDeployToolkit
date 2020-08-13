@@ -306,6 +306,7 @@ if ($appDeployLogoBannerHeight -gt $appDeployLogoBannerMaxHeight) {
 [Xml.XmlElement]$xmlToolkitOptions = $xmlConfig.Toolkit_Options
 [boolean]$configToolkitRequireAdmin = [boolean]::Parse($xmlToolkitOptions.Toolkit_RequireAdmin)
 [string]$configToolkitTempPath = $ExecutionContext.InvokeCommand.ExpandString($xmlToolkitOptions.Toolkit_TempPath)
+[string]$configToolkitCachePath = $ExecutionContext.InvokeCommand.ExpandString($xmlToolkitOptions.Toolkit_CachePath)
 [string]$configToolkitRegPath = $xmlToolkitOptions.Toolkit_RegPath
 [string]$configToolkitLogDir = $ExecutionContext.InvokeCommand.ExpandString($xmlToolkitOptions.Toolkit_LogPath)
 [boolean]$configToolkitCompressLogs = [boolean]::Parse($xmlToolkitOptions.Toolkit_CompressLogs)
@@ -321,11 +322,14 @@ if ($appDeployLogoBannerHeight -gt $appDeployLogoBannerMaxHeight) {
 [string]$configMSIUninstallParams = $ExecutionContext.InvokeCommand.ExpandString($xmlConfigMSIOptions.MSI_UninstallParams)
 [string]$configMSILogDir = $ExecutionContext.InvokeCommand.ExpandString($xmlConfigMSIOptions.MSI_LogPath)
 [int32]$configMSIMutexWaitTime = $xmlConfigMSIOptions.MSI_MutexWaitTime
-#  Change paths to user accessible ones if RequireAdmin is false
-If ($configToolkitRequireAdmin -eq $false){
+#  Change paths to user specific ones if user does not have admin rights
+If ($IsAdmin -eq $false) {
 	If ($xmlToolkitOptions.Toolkit_TempPathNoAdminRights) {
 		[string]$configToolkitTempPath = $ExecutionContext.InvokeCommand.ExpandString($xmlToolkitOptions.Toolkit_TempPathNoAdminRights)
 	}
+	If ($xmlToolkitOptions.Toolkit_CachePathNoAdminRights) {
+		[string]$configToolkitCachePath = $ExecutionContext.InvokeCommand.ExpandString($xmlToolkitOptions.Toolkit_CachePathNoAdminRights)
+	}	
 	If ($xmlToolkitOptions.Toolkit_RegPathNoAdminRights) {
 		[string]$configToolkitRegPath = $xmlToolkitOptions.Toolkit_RegPathNoAdminRights
 	}
@@ -452,6 +456,14 @@ If ($configToolkitRequireAdmin -eq $false){
 ## Variables: Script Directories
 [string]$dirFiles = Join-Path -Path $scriptParentPath -ChildPath 'Files'
 [string]$dirSupportFiles = Join-Path -Path $scriptParentPath -ChildPath 'SupportFiles'
+If ($IsAdmin) {
+	[string]$dirLogs = Join-Path -Path $configToolkitLogPath -ChildPath ($appDeployToolkitName + '\Logs')
+	[string]$dirCache = Join-Path -Path $configToolkitCachePath -ChildPath ($appDeployToolkitName + '\Cache')
+}
+Else {
+	[string]$dirLogs = Join-Path -Path $configToolkitLogPath -ChildPath ($appDeployToolkitName + '\Logs\' + $envUserName )
+	[string]$dirCache = Join-Path -Path $configToolkitCachePath -ChildPath ($appDeployToolkitName + '\Cache\' + $envUserName)
+}
 [string]$dirAppDeployTemp = Join-Path -Path $configToolkitTempPath -ChildPath $appDeployToolkitName
 
 ## Set the deployment type to "Install" if it has not been specified
@@ -708,7 +720,7 @@ Function Write-Log {
 		[string]$LogType = $configToolkitLogStyle,
 		[Parameter(Mandatory=$false,Position=5)]
 		[ValidateNotNullorEmpty()]
-		[string]$LogFileDirectory = $(If ($configToolkitCompressLogs) { $logTempFolder } Else { $configToolkitLogDir }),
+		[string]$LogFileDirectory = $(If ($configToolkitCompressLogs) { $logTempFolder } Else { $dirLogs }),
 		[Parameter(Mandatory=$false,Position=6)]
 		[ValidateNotNullorEmpty()]
 		[string]$LogFileName = $logName,
@@ -1225,7 +1237,7 @@ Function Exit-Script {
 		. $DisableScriptLogging
 
 		[string]$DestinationArchiveFileName = $installName + '_' + $deploymentType + '_' + ((Get-Date -Format 'yyyy-MM-dd-hh-mm-ss').ToString()) + '.zip'
-		New-ZipFile -DestinationArchiveDirectoryPath $configToolkitLogDir -DestinationArchiveFileName $DestinationArchiveFileName -SourceDirectory $logTempFolder -RemoveSourceAfterArchiving
+		New-ZipFile -DestinationArchiveDirectoryPath $dirLogs -DestinationArchiveFileName $DestinationArchiveFileName -SourceDirectory $logTempFolder -RemoveSourceAfterArchiving
 	}
 
 	If ($script:notifyIcon) { Try { $script:notifyIcon.Dispose() } Catch {} }
@@ -5061,11 +5073,12 @@ Function Execute-ProcessAsUser {
 
 		## Build the scheduled task XML name
 		[string]$schTaskName = "$appDeployToolkitName-ExecuteAsUser"
-
-		##  Create the temporary App Deploy Toolkit files folder if it doesn't already exist
-		If (-not (Test-Path -LiteralPath $dirAppDeployTemp -PathType 'Container')) {
-			New-Item -Path $dirAppDeployTemp -ItemType 'Directory' -Force -ErrorAction 'Stop'
+		## Delete the cache App Deploy Toolkit files folder and recreate it (this fixes potential security issues with permissions)
+		[string]$executeProcessAsUserCachePath = Join-Path -Path $dirCache -ChildPath $schTaskName
+		If (Test-Path -LiteralPath $executeProcessAsUserCachePath -PathType 'Container') {
+			Remove-Folder -Path $executeProcessAsUserCachePath -ContinueOnError $false
 		}
+		New-Item -path $executeProcessAsUserCachePath -ItemType 'Directory' -Force -ErrorAction 'Stop'
 
 		## If PowerShell.exe is being launched, then create a VBScript to launch PowerShell so that we can suppress the console window that flashes otherwise
 		If (($Path -eq 'PowerShell.exe') -or ((Split-Path -Path $Path -Leaf) -eq 'PowerShell.exe')) {
@@ -5078,9 +5091,9 @@ Function Execute-ProcessAsUser {
 			$executeProcessAsUserScript += 'set oWShell = CreateObject("WScript.Shell")'
 			$executeProcessAsUserScript += 'intReturn = oWShell.Run(strCommand, 0, true)'
 			$executeProcessAsUserScript += 'WScript.Quit intReturn'
-			$executeProcessAsUserScript | Out-File -FilePath "$dirAppDeployTemp\$($schTaskName).vbs" -Force -Encoding 'default' -ErrorAction 'SilentlyContinue'
+			$executeProcessAsUserScript | Out-File -FilePath "$executeProcessAsUserCachePath\$($schTaskName).vbs" -Force -Encoding 'default' -ErrorAction 'SilentlyContinue'
 			$Path = "$envWinDir\System32\wscript.exe"
-			$Parameters = "`"$dirAppDeployTemp\$($schTaskName).vbs`""
+			$Parameters = "`"$executeProcessAsUserCachePath\$($schTaskName).vbs`""
 		}
 
 		## Prepare working directory insert
@@ -5131,7 +5144,7 @@ Function Execute-ProcessAsUser {
 		## Export the XML to file
 		Try {
 			#  Specify the filename to export the XML to
-			[string]$xmlSchTaskFilePath = "$dirAppDeployTemp\$schTaskName.xml"
+			[string]$xmlSchTaskFilePath = "$blockExecutionCachePath\$schTaskName.xml"
 			[string]$xmlSchTask | Out-File -FilePath $xmlSchTaskFilePath -Force -ErrorAction 'Stop'
 		}
 		Catch {
@@ -5236,6 +5249,11 @@ Function Execute-ProcessAsUser {
 		}
 		Catch {
 			Write-Log -Message "Failed to delete scheduled task [$schTaskName]. `n$(Resolve-Error)" -Severity 3 -Source ${CmdletName}
+		}
+
+		## Delete cache directory
+		If (Test-Path -LiteralPath $executeProcessAsUserCachePath -PathType 'Container') {
+			Remove-Folder -Path $executeProcessAsUserCachePath
 		}
 	}
 	End {
@@ -5493,7 +5511,8 @@ Function Block-AppExecution {
 		[char[]]$invalidScheduledTaskChars = '$', '!', '''', '"', '(', ')', ';', '\', '`', '*', '?', '{', '}', '[', ']', '<', '>', '|', '&', '%', '#', '~', '@', ' '
 		[string]$SchInstallName = $installName
 		ForEach ($invalidChar in $invalidScheduledTaskChars) { [string]$SchInstallName = $SchInstallName -replace [regex]::Escape($invalidChar),'' }
-		[string]$schTaskUnblockAppsCommand += "-ExecutionPolicy Bypass -NoProfile -NoLogo -WindowStyle Hidden -File `"$dirAppDeployTemp\$scriptFileName`" -CleanupBlockedApps -ReferredInstallName `"$SchInstallName`" -ReferredInstallTitle `"$installTitle`" -ReferredLogName `"$logName`" -AsyncToolkitLaunch"
+		[string]$blockExecutionCachePath = Join-Path -Path $dirCache -ChildPath $SchInstallName
+		[string]$schTaskUnblockAppsCommand += "-ExecutionPolicy Bypass -NoProfile -NoLogo -WindowStyle Hidden -File `"$blockExecutionCachePath\$scriptFileName`" -CleanupBlockedApps -ReferredInstallName `"$SchInstallName`" -ReferredInstallTitle `"$installTitle`" -ReferredLogName `"$logName`" -AsyncToolkitLaunch"
 		## Specify the scheduled task configuration in XML format
 		[string]$xmlUnblockAppsSchTask = @"
 <?xml version="1.0" encoding="UTF-16"?>
@@ -5546,24 +5565,21 @@ Function Block-AppExecution {
 
 		[string]$schTaskBlockedAppsName = $installName + '_BlockedApps'
 
-		## Delete this file if it exists as it can cause failures (it is a bug from an older version of the toolkit)
-		If (Test-Path -LiteralPath "$configToolkitTempPath\PSAppDeployToolkit" -PathType 'Leaf' -ErrorAction 'SilentlyContinue') {
-			$null = Remove-Item -LiteralPath "$configToolkitTempPath\PSAppDeployToolkit" -Force -ErrorAction 'SilentlyContinue'
+		## Delete the cache App Deploy Toolkit files folder and recreate it (this fixes potential security issues with permissions)
+		If (Test-Path -LiteralPath $blockExecutionCachePath -PathType 'Container') {
+			Remove-Folder -Path $blockExecutionCachePath -ContinueOnError $false
 		}
-		## Create Temporary directory (if required) and copy Toolkit so it can be called by scheduled task later if required
-		If (-not (Test-Path -LiteralPath $dirAppDeployTemp -PathType 'Container' -ErrorAction 'SilentlyContinue')) {
-			$null = New-Item -Path $dirAppDeployTemp -ItemType 'Directory' -ErrorAction 'SilentlyContinue'
-		}
+		New-Item -path $blockExecutionCachePath -ItemType 'Directory' -Force -ErrorAction 'Stop'
 
-		Copy-Item -Path "$scriptRoot\*.*" -Destination $dirAppDeployTemp -Exclude 'thumbs.db' -Force -Recurse -ErrorAction 'SilentlyContinue'
+		Copy-Item -Path "$scriptRoot\*.*" -Destination $blockExecutionCachePath -Exclude 'thumbs.db' -Force -Recurse -ErrorAction 'SilentlyContinue'
 
 		## Build the debugger block value script
-		[string]$debuggerBlockMessageCmd = "`"$PSHome\powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -WindowStyle Hidden -File `" & chr(34) & `"$dirAppDeployTemp\$scriptFileName`" & chr(34) & `" -ShowBlockedAppDialog -AsyncToolkitLaunch -ReferredInstallTitle `" & chr(34) & `"$installTitle`" & chr(34)"
+		[string]$debuggerBlockMessageCmd = "`"$PSHome\powershell.exe -ExecutionPolicy Bypass -NoProfile -NoLogo -WindowStyle Hidden -File `" & chr(34) & `"$blockExecutionCachePath\$scriptFileName`" & chr(34) & `" -ShowBlockedAppDialog -AsyncToolkitLaunch -ReferredInstallTitle `" & chr(34) & `"$installTitle`" & chr(34)"
 		[string[]]$debuggerBlockScript = "strCommand = $debuggerBlockMessageCmd"
 		$debuggerBlockScript += 'set oWShell = CreateObject("WScript.Shell")'
 		$debuggerBlockScript += 'oWShell.Run strCommand, 0, false'
-		$debuggerBlockScript | Out-File -FilePath "$dirAppDeployTemp\AppDeployToolkit_BlockAppExecutionMessage.vbs" -Force -Encoding 'default' -ErrorAction 'SilentlyContinue'
-		[string]$debuggerBlockValue = "$envWinDir\System32\wscript.exe `"$dirAppDeployTemp\AppDeployToolkit_BlockAppExecutionMessage.vbs`""
+		$debuggerBlockScript | Out-File -FilePath "$blockExecutionCachePath\AppDeployToolkit_BlockAppExecutionMessage.vbs" -Force -Encoding 'default' -ErrorAction 'SilentlyContinue'
+		[string]$debuggerBlockValue = "$envWinDir\System32\wscript.exe `"$blockExecutionCachePath\AppDeployToolkit_BlockAppExecutionMessage.vbs`""
 
 		## Create a scheduled task to run on startup to call this script and clean up blocked applications in case the installation is interrupted, e.g. user shuts down during installation"
 		Write-Log -Message 'Create scheduled task to cleanup blocked applications in case installation is interrupted.' -Source ${CmdletName}
@@ -5574,7 +5590,7 @@ Function Block-AppExecution {
 			## Export the scheduled task XML to file
 			Try {
 				#  Specify the filename to export the XML to
-				[string]$xmlSchTaskFilePath = "$dirAppDeployTemp\SchTaskUnBlockApps.xml"
+				[string]$xmlSchTaskFilePath = "$blockExecutionCachePath\SchTaskUnBlockApps.xml"
 				[string]$xmlUnblockAppsSchTask | Out-File -FilePath $xmlSchTaskFilePath -Force -ErrorAction 'Stop'
 			}
 			Catch {
@@ -5662,6 +5678,11 @@ Function Unblock-AppExecution {
 		}
 		Catch {
 			Write-Log -Message "Error retrieving/deleting Scheduled Task.`n$(Resolve-Error)" -Severity 3 -Source ${CmdletName}
+		}
+		## Remove the cache folder
+		[string]$blockExecutionCachePath = Join-Path -Path $dirCache -ChildPath $schTaskBlockedAppsName
+		If (Test-Path -LiteralPath $blockExecutionCachePath -PathType 'Container') {
+			Remove-Folder -Path $blockExecutionCachePath -ContinueOnError $false
 		}
 	}
 	End {
@@ -10927,7 +10948,7 @@ If (-not $installName) {
 If ($ReferredLogName) { [string]$logName = $ReferredLogName }
 If (-not $logName) { [string]$logName = $installName + '_' + $appDeployToolkitName + '_' + $deploymentType + '.log' }
 #  If option to compress logs is selected, then log will be created in temp log folder ($logTempFolder) and then copied to actual log folder ($configToolkitLogDir) after being zipped.
-[string]$logTempFolder = Join-Path -Path $envTemp -ChildPath "${installName}_$deploymentType"
+[string]$logTempFolder = Join-Path -Path $dirAppDeployTemp -ChildPath "${installName}_$deploymentType"
 If ($configToolkitCompressLogs) {
 	#  If the temp log folder already exists from a previous ZIP operation, then delete all files in it to avoid issues
 	If (Test-Path -LiteralPath $logTempFolder -PathType 'Container' -ErrorAction 'SilentlyContinue') {
